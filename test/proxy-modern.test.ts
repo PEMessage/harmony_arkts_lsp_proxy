@@ -315,6 +315,66 @@ describe('createProxy modern mode', () => {
     });
   });
 
+  it('normalizes the newer { info: [...] } ace hover payload', async () => {
+    const fakeAce = createFakeAceServer({
+      hoverResult: {
+        contents: JSON.stringify({
+          info: [
+            {
+              code: {
+                language: 'ts',
+                value: '(method) window.WindowStage.loadContent(path: string): Promise<void>',
+              },
+              data: [
+                {
+                  document: 'Loads the content of a page.',
+                  tags: ['@param path of the page'],
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    });
+    aceConnection = fakeAce.connection;
+    mockedStartAceServer.mockReturnValue(fakeAce.handle);
+
+    const env = createEnv();
+    const client = createClient(env);
+    proxyHandle = client.handle;
+    clientConnection = client.connection;
+
+    const filePath = path.resolve('test/fixtures/sample-project/entry/src/main/ets/pages/Index.ets');
+    const uri = `file://${filePath}`;
+
+    await clientConnection.sendRequest('initialize', {
+      processId: process.pid,
+      rootUri: 'file:///tmp/not-the-arkts-project',
+      capabilities: {},
+    });
+    clientConnection.sendNotification('initialized', {});
+    clientConnection.sendNotification('textDocument/didOpen', {
+      textDocument: { uri, languageId: 'arkts', version: 1, text: 'const TAG = "Index"' },
+    });
+
+    const hover = await timeout(
+      clientConnection.sendRequest('textDocument/hover', {
+        textDocument: { uri },
+        position: { line: 0, character: 7 },
+      }),
+      250,
+    );
+
+    expect(hover).toEqual({
+      contents: {
+        kind: 'markdown',
+        value:
+          '```ts\n(method) window.WindowStage.loadContent(path: string): Promise<void>\n```\n\n' +
+          'Loads the content of a page.\n\n@param path of the page',
+      },
+    });
+  });
+
   it('does not block initialize while hvigor sync is running in background', async () => {
     const fakeAce = createFakeAceServer();
     aceConnection = fakeAce.connection;

@@ -176,7 +176,7 @@ function parseAceHoverPayload(value: string): Record<string, unknown> | null {
     if (!isPlainObject(parsed)) {
       return null;
     }
-    if (!isPlainObject(parsed.code) && !('data' in parsed)) {
+    if (!isPlainObject(parsed.code) && !('data' in parsed) && !Array.isArray(parsed.info)) {
       return null;
     }
     return parsed;
@@ -202,14 +202,23 @@ function normalizeAceHoverContents(contents: unknown): unknown {
   }
 
   const parts: string[] = [];
-  const code = isPlainObject(payload.code) ? payload.code : null;
-  const codeValue = typeof code?.value === 'string' ? decodeHtmlEntities(code.value).trim() : '';
-  if (codeValue.length) {
-    const language = sanitizeMarkdownLanguage(code?.language);
-    parts.push(`\`\`\`${language}\n${codeValue}\n\`\`\``);
-  }
+  // Newer ace-server wraps hover data in `{ info: [{ code, data }] }`; older
+  // builds return `{ code, data }` directly.
+  const entries = Array.isArray(payload.info)
+    ? (payload.info as unknown[]).filter(isPlainObject)
+    : [];
+  const list = entries.length > 0 ? entries : [payload];
 
-  parts.push(...extractHoverDocuments(payload.data));
+  for (const entry of list) {
+    const code = isPlainObject(entry.code) ? entry.code : null;
+    const codeValue = typeof code?.value === 'string' ? decodeHtmlEntities(code.value).trim() : '';
+    if (codeValue.length) {
+      const language = sanitizeMarkdownLanguage(code?.language);
+      parts.push(`\`\`\`${language}\n${codeValue}\n\`\`\``);
+    }
+
+    parts.push(...extractHoverDocuments(entry.data));
+  }
 
   if (parts.length === 0) {
     return contents;
