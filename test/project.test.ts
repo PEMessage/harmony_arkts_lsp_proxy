@@ -99,3 +99,57 @@ describe('deviceType derivation', () => {
     expect(result!.modules[0].deviceType).toEqual([5]);
   });
 });
+
+describe('SDK layout detection and targetSdkVersion', () => {
+  let tmpDir: string;
+  let sdkDefault: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'arkts-sdk-'));
+    sdkDefault = path.join(tmpDir, 'sdk', 'default');
+    // HarmonyOS 26 layout: everything nested under openharmony/.
+    fs.mkdirSync(path.join(sdkDefault, 'openharmony', 'js', 'api'), { recursive: true });
+    fs.mkdirSync(path.join(sdkDefault, 'openharmony', 'js', 'build-tools', 'ace-loader'), { recursive: true });
+    fs.mkdirSync(path.join(sdkDefault, 'openharmony', 'ets', 'api'), { recursive: true });
+    fs.mkdirSync(path.join(sdkDefault, 'openharmony', 'ets', 'kits'), { recursive: true });
+
+    fs.mkdirSync(path.join(tmpDir, 'entry'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'entry', 'module.json5'),
+      "{ module: { name: 'entry', type: 'entry', deviceTypes: ['phone'] } }",
+    );
+    // Only targetSdkVersion (the newer field); no compileSdkVersion/targetAPIVersion.
+    fs.writeFileSync(
+      path.join(tmpDir, 'build-profile.json5'),
+      `{
+  app: { products: [ { name: 'default', compatibleSdkVersion: '26.0.0', targetSdkVersion: '26.0.0' } ] },
+  modules: [ { name: 'entry', srcPath: './entry' } ]
+}`,
+    );
+  });
+
+  afterEach(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+
+  it('resolves the openharmony/ SDK layout', () => {
+    const mod = parseProject(tmpDir, sdkDefault)!.modules[0];
+    expect(mod.sdkJsPath).toBe(path.join(sdkDefault, 'openharmony', 'js', 'api') + path.sep);
+    expect(mod.aceLoaderPath).toBe(path.join(sdkDefault, 'openharmony', 'js', 'build-tools', 'ace-loader'));
+    expect(mod.sdkApiPath).toBe(path.join(sdkDefault, 'openharmony', 'ets', 'api') + path.sep);
+    expect(mod.hosSdkPath).toBe(path.join(sdkDefault, 'openharmony') + path.sep);
+  });
+
+  it('falls back to the legacy js/api/<device> shape when nothing is found', () => {
+    const mod = parseProject(tmpDir, '/mock/sdk/default')!.modules[0];
+    expect(mod.sdkJsPath).toContain('js/api/phone');
+    expect(mod.aceLoaderPath).toContain('js/framework/phone/ace-loader');
+    expect(mod.sdkApiPath).toBeUndefined();
+    expect(mod.hosSdkPath).toBeUndefined();
+  });
+
+  it('reads compileSdkVersion from targetSdkVersion instead of defaulting to 12', () => {
+    const mod = parseProject(tmpDir, sdkDefault)!.modules[0];
+    expect(mod.compatibleSdkVersion).toBe('26');
+    expect(mod.compileSdkLevel).toBe('26');
+    expect(mod.compileSdkVersion).toBe('26.0.0');
+  });
+});

@@ -10,6 +10,10 @@ export interface AceModule {
   aceLoaderPath: string;
   jsComponentType: number | 'declarative';
   sdkJsPath: string;
+  /** ArkTS SDK api dir (used by ace-server to locate `ets/kits`). */
+  sdkApiPath?: string;
+  /** SDK root (the dir holding `ets`/`js`); ace-server uses it as the SDK base. */
+  hosSdkPath?: string;
   compatibleSdkLevel: string;
   compatibleSdkVersion: string;
   apiType: string;
@@ -39,6 +43,8 @@ interface BuildProfile {
     products?: Array<Record<string, unknown>>;
     minAPIVersion?: unknown;
     targetAPIVersion?: unknown;
+    targetSdkVersion?: unknown;
+    compileSdkVersion?: unknown;
     compileSdkType?: string;
     runtimeOS?: string;
     compatibleDeviceType?: unknown;
@@ -63,6 +69,7 @@ interface ProjectParseOptions {
 interface ProfileProduct {
   compatibleSdkVersion?: unknown;
   compileSdkVersion?: unknown;
+  targetSdkVersion?: unknown;
   compileSdkType?: unknown;
   runtimeOS?: unknown;
   compatibleDeviceType?: unknown;
@@ -188,10 +195,60 @@ function getProfileProduct(profile: BuildProfile): ProfileProduct {
   return {
     compatibleSdkVersion: profile?.app?.minAPIVersion,
     compileSdkVersion: profile?.app?.targetAPIVersion,
+    targetSdkVersion: profile?.app?.targetSdkVersion,
     compileSdkType: profile?.app?.compileSdkType,
     runtimeOS: profile?.app?.runtimeOS,
     compatibleDeviceType: profile?.app?.compatibleDeviceType,
   };
+}
+
+function firstExistingDir(candidates: string[]): string | null {
+  for (const candidate of candidates) {
+    if (isDirectory(candidate)) return candidate;
+  }
+  return null;
+}
+
+interface ResolvedSdkPaths {
+  sdkJsPath: string;
+  aceLoaderPath: string;
+  sdkApiPath?: string;
+  hosSdkPath?: string;
+}
+
+/**
+ * Resolve SDK paths from the actual on-disk layout.
+ *
+ * Newer SDKs (HarmonyOS 26+) nest everything under `openharmony/`
+ * (`<sdk>/default/openharmony/{ets,js}/...`); older ones put `ets`/`js`
+ * directly under `<sdk>/default`. The original hard-coded
+ * `<sdk>/default/js/api/<device>` shape matches neither, so detect what exists
+ * and fall back to the original values unchanged when nothing is found.
+ */
+function resolveSdkPaths(sdkPath: string, deviceName: string): ResolvedSdkPaths {
+  const roots = [path.join(sdkPath, 'openharmony'), sdkPath];
+  const sdkRoot = roots.find((r) => isDirectory(path.join(r, 'js')) || isDirectory(path.join(r, 'ets'))) ?? sdkPath;
+
+  const sdkJsPath =
+    (firstExistingDir([
+      path.join(sdkRoot, 'js', 'api', deviceName),
+      path.join(sdkRoot, 'js', 'api'),
+      path.join(sdkPath, 'js', 'api', deviceName),
+    ]) ?? path.join(sdkPath, 'js', 'api', deviceName)) + path.sep;
+
+  const aceLoaderPath =
+    firstExistingDir([
+      path.join(sdkRoot, 'js', 'framework', deviceName, 'ace-loader'),
+      path.join(sdkRoot, 'js', 'build-tools', 'ace-loader'),
+      path.join(sdkRoot, 'ets', 'build-tools', 'ets-loader'),
+      path.join(sdkPath, 'js', 'framework', deviceName, 'ace-loader'),
+    ]) ?? path.join(sdkPath, 'js', 'framework', deviceName, 'ace-loader');
+
+  const etsApi = path.join(sdkRoot, 'ets', 'api');
+  const sdkApiPath = isDirectory(etsApi) ? etsApi + path.sep : undefined;
+  const hosSdkPath = isDirectory(path.join(sdkRoot, 'ets')) ? sdkRoot + path.sep : undefined;
+
+  return { sdkJsPath, aceLoaderPath, sdkApiPath, hosSdkPath };
 }
 
 function buildModuleConfig(
@@ -214,8 +271,18 @@ function buildModuleConfig(
   const deviceType = parseDeviceType(moduleDescriptor?.module?.deviceTypes ?? productDeviceType);
   const deviceName = resolveDeviceName(deviceType[0] ?? DEFAULT_DEVICE_TYPE);
 
-  const compatibleSdkVersion = parseMajorVersion(product.compatibleSdkVersion);
-  const compileSdkVersion = parseMajorVersion(product.compileSdkVersion ?? buildProfile.app?.targetAPIVersion);
+  const compatibleSdkVersion = parseMajorVersion(product.compatibleSdkVersion ?? buildProfile.app?.minAPIVersion);
+  // Read both the new (`targetSdkVersion`) and legacy (`targetAPIVersion`)
+  // field names; fall back to the compatible version rather than a fixed 12.
+  const compileSdkValue =
+    product.compileSdkVersion ??
+    product.targetSdkVersion ??
+    buildProfile.app?.targetAPIVersion ??
+    buildProfile.app?.targetSdkVersion ??
+    product.compatibleSdkVersion ??
+    buildProfile.app?.minAPIVersion;
+  const compileSdkLevel = parseMajorVersion(compileSdkValue);
+  const sdkPaths = resolveSdkPaths(sdkPath, deviceName);
 
   const permissions = moduleDescriptor?.module?.requestPermissions
     ? moduleDescriptor.module.requestPermissions
@@ -236,8 +303,8 @@ function buildModuleConfig(
     packageManagerType: 'ohpm',
     compatibleSdkLevel: compatibleSdkVersion,
     compatibleSdkVersion,
-    compileSdkLevel: parseMajorVersion(compileSdkVersion),
-    compileSdkVersion: parseSemanticVersion(compileSdkVersion),
+    compileSdkLevel,
+    compileSdkVersion: parseSemanticVersion(compileSdkValue),
     compileSdkType: String(product.compileSdkType ?? 'Canary'),
     runtimeOs: String(product.runtimeOS ?? 'OpenHarmony'),
     moduleType: String(moduleDescriptor?.module?.type || 'entry'),
@@ -246,8 +313,10 @@ function buildModuleConfig(
     moduleDependencies,
     permissions,
     packageName: moduleDescriptor?.module?.name,
-    sdkJsPath: path.join(sdkPath, 'js', 'api', deviceName) + path.sep,
-    aceLoaderPath: path.join(sdkPath, 'js', 'framework', deviceName, 'ace-loader'),
+    sdkJsPath: sdkPaths.sdkJsPath,
+    aceLoaderPath: sdkPaths.aceLoaderPath,
+    ...(sdkPaths.sdkApiPath ? { sdkApiPath: sdkPaths.sdkApiPath } : {}),
+    ...(sdkPaths.hosSdkPath ? { hosSdkPath: sdkPaths.hosSdkPath } : {}),
   };
 }
 
@@ -420,7 +489,11 @@ export function parseProject(projectRoot: string, sdkPath: string): ProjectConfi
     compatibleSdkLevel,
     compatibleSdkVersion: compatibleSdkLevel,
     compileSdkLevel: m.compileSdkLevel ?? compatibleSdkLevel,
-    compileSdkVersion: m.compileSdkVersion ?? parseSemanticVersion(product.compileSdkVersion ?? profile.app?.targetAPIVersion),
+    compileSdkVersion:
+      m.compileSdkVersion ??
+      parseSemanticVersion(
+        product.compileSdkVersion ?? product.targetSdkVersion ?? profile.app?.targetAPIVersion ?? profile.app?.targetSdkVersion,
+      ),
   }));
 
   return {
