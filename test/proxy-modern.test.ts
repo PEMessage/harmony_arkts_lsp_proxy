@@ -43,7 +43,7 @@ function createFakeAceServer(): {
   notifications: Array<{ method: string; params: Record<string, unknown> }>;
   connection: MessageConnection;
 };
-function createFakeAceServer(options?: { hoverResult?: unknown }): {
+function createFakeAceServer(options?: { hoverResult?: unknown; inlayHints?: unknown }): {
   handle: AceServerHandle;
   events: string[];
   notifications: Array<{ method: string; params: Record<string, unknown> }>;
@@ -68,10 +68,20 @@ function createFakeAceServer(options?: { hoverResult?: unknown }): {
     new StreamMessageWriter(aceStdout),
   );
 
-  connection.onRequest((method) => {
+  connection.onRequest((method, params) => {
     events.push(`request:${method}`);
     if (method === 'initialize') {
       return { capabilities: { hoverProvider: true } };
+    }
+    if (method === 'textDocument/inlayHint') {
+      const uri = (params as { textDocument?: { uri?: string } })?.textDocument?.uri;
+      queueMicrotask(() =>
+        connection.sendNotification('aceProject/parameterNameInlayHints', {
+          uri,
+          inlayHints: options?.inlayHints ?? [],
+        }),
+      );
+      return null;
     }
     return null;
   });
@@ -373,6 +383,47 @@ describe('createProxy modern mode', () => {
           'Loads the content of a page.\n\n@param path of the page',
       },
     });
+  });
+
+  it('exposes inlay hints from the ace-server push notification', async () => {
+    const fakeAce = createFakeAceServer({
+      inlayHints: [{ text: ': void', position: 5, kind: 'Type', whitespaceBefore: true }],
+    });
+    aceConnection = fakeAce.connection;
+    mockedStartAceServer.mockReturnValue(fakeAce.handle);
+
+    const env = createEnv();
+    const client = createClient(env);
+    proxyHandle = client.handle;
+    clientConnection = client.connection;
+
+    const filePath = path.resolve('test/fixtures/sample-project/entry/src/main/ets/pages/Index.ets');
+    const uri = `file://${filePath}`;
+
+    const init = (await clientConnection.sendRequest('initialize', {
+      processId: process.pid,
+      rootUri: 'file:///tmp/not-the-arkts-project',
+      capabilities: {},
+    })) as { capabilities: Record<string, unknown> };
+    expect(init.capabilities.inlayHintProvider).toBeTruthy();
+
+    clientConnection.sendNotification('initialized', {});
+    clientConnection.sendNotification('textDocument/didOpen', {
+      textDocument: { uri, languageId: 'arkts', version: 1, text: 'void build()\n{\n}\n' },
+    });
+
+    const hints = await timeout(
+      clientConnection.sendRequest('textDocument/inlayHint', {
+        textDocument: { uri },
+        range: { start: { line: 0, character: 0 }, end: { line: 3, character: 0 } },
+      }),
+      500,
+    );
+
+    // offset 5 in "void build()\n..." -> line 0, character 5
+    expect(hints).toEqual([
+      { position: { line: 0, character: 5 }, label: ': void', kind: 1, paddingLeft: true, paddingRight: false },
+    ]);
   });
 
   it('does not block initialize while hvigor sync is running in background', async () => {

@@ -265,6 +265,10 @@ function addProxyCapabilities(result: unknown): unknown {
       ...capabilities,
       documentSymbolProvider: true,
       workspaceSymbolProvider: true,
+      // ace-server computes inlay hints but pushes them via
+      // `aceProject/parameterNameInlayHints` instead of advertising the
+      // standard provider; the proxy exposes the standard method itself.
+      inlayHintProvider: { resolveProvider: false },
     },
   };
 }
@@ -388,8 +392,35 @@ function readFileText(uri: string): string | null {
   }
 }
 
-function createRequestPayload(params: RpcParams): RpcPayload {
-  return {
+/** Convert a UTF-16 code-unit offset in `text` to an LSP { line, character }. */
+function offsetToPosition(text: string, offset: number): { line: number; character: number } {
+  const clamped = Math.max(0, Math.min(offset, text.length));
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < clamped; i += 1) {
+    if (text.charCodeAt(i) === 10 /* \n */) {
+      line += 1;
+      lineStart = i + 1;
+    }
+  }
+  return { line, character: clamped - lineStart };
+}
+
+/** Convert ace-server's pushed `inlayHints` into standard LSP InlayHint[] . */
+function convertAceInlayHints(text: string, inlayHints: unknown): unknown[] {
+  if (!Array.isArray(inlayHints)) {
+    return [];
+  }
+  return inlayHints.filter(isPlainObject).map((hint) => ({
+    position: offsetToPosition(text, typeof hint.position === 'number' ? hint.position : 0),
+    label: typeof hint.text === 'string' ? hint.text : '',
+    kind: hint.kind === 'Type' ? 1 : 2,
+    paddingLeft: Boolean(hint.whitespaceBefore),
+    paddingRight: Boolean(hint.whitespaceAfter),
+  }));
+}
+
+function createRequestPayload(params: RpcParams): RpcPayload {  return {
     requestId: createQueueToken(),
     params: params || {},
     editorFiles: [],
@@ -746,6 +777,11 @@ export function createProxy(
   const requestQueue: Array<QueuedRequest> = [];
   const notificationQueue: Array<QueuedNotification> = [];
   const pendingAceRequests = new Map<string, PendingAceRequest>();
+  // ace-server answers `textDocument/inlayHint` by pushing
+  // `aceProject/parameterNameInlayHints` (often proactively, before a request),
+  // so cache the latest hints per document and serve requests from it.
+  const latestInlayHints = new Map<string, unknown>();
+  const pendingInlayHints = new Map<string, (hints: unknown) => void>();
   let isInitialized = false;
   let isServerReady = false;
   let isBootstrapping = false;
@@ -861,6 +897,20 @@ export function createProxy(
     const conn = createMessageConnection(new StreamMessageReader(proc.stdout), new StreamMessageWriter(proc.stdin));
 
     conn.onNotification((method, params) => {
+      if (method === 'aceProject/parameterNameInlayHints') {
+        // ace-server pushes inlay hints instead of replying to the request.
+        const payload = isPlainObject(params) ? params : {};
+        const uri = typeof payload.uri === 'string' ? payload.uri : null;
+        if (uri) {
+          latestInlayHints.set(uri, payload.inlayHints);
+          const resolve = pendingInlayHints.get(uri);
+          if (resolve) {
+            pendingInlayHints.delete(uri);
+            resolve(payload.inlayHints);
+          }
+        }
+        return;
+      }
       if (completePendingAceRequest(method, params)) {
         return;
       }
@@ -891,6 +941,38 @@ export function createProxy(
     });
 
     return conn;
+  }
+
+  function requestInlayHints(uri: string, params: RpcParams): Promise<unknown> {
+    const conn = aceConn;
+    if (!conn) {
+      return Promise.resolve([]);
+    }
+    const text = (): string => openDocumentTexts.get(uri) ?? readFileText(uri) ?? '';
+    const cached = latestInlayHints.get(uri);
+
+    // Ask for a refresh so the next request sees current hints.
+    try {
+      conn.sendRequest('textDocument/inlayHint', (params ?? {}) as RpcPayload).catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+
+    if (cached !== undefined) {
+      return Promise.resolve(convertAceInlayHints(text(), cached));
+    }
+
+    // No hints pushed yet: wait briefly for ace-server to push some.
+    return new Promise<unknown>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingInlayHints.delete(uri);
+        resolve(convertAceInlayHints(text(), latestInlayHints.get(uri) ?? []));
+      }, 2500);
+      pendingInlayHints.set(uri, (hints) => {
+        clearTimeout(timer);
+        resolve(convertAceInlayHints(text(), hints));
+      });
+    });
   }
 
   function scheduleHvigorSync(projectRoot: string): void {
@@ -1065,6 +1147,15 @@ export function createProxy(
         resultCount: symbols.length,
       });
       return Promise.resolve(symbols);
+    }
+
+    if (method === 'textDocument/inlayHint') {
+      const uri = getTextDocumentUri(params);
+      if (!uri || !aceConn) {
+        return Promise.resolve([]);
+      }
+      traceLsp('request route', { method, route: 'ace-inlay-push' });
+      return requestInlayHints(uri, params);
     }
 
     const mapped = mapRequest(method, params, openFiles);

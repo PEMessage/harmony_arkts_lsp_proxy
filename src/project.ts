@@ -526,7 +526,21 @@ export function buildInitializationOptions(project: ProjectConfig): Record<strin
     deviceType: firstDeviceType,
     indexingDataLocation: path.join(project.projectRoot, '.ide-arkts', 'indexing'),
     completionSortSetting: { sortMode: 'normal' },
-    inlayHintsSetting: {},
+    // ace-server needs a full shape here; an empty object throws
+    // (`etsParameterNameHintKind` of undefined) and disables all hints.
+    inlayHintsSetting: {
+      parameterNames: { etsParameterNameHintKind: 'all', tsParameterNameHintKind: 'all' },
+      typeSetting: {
+        tsVariablesEnable: true,
+        tsPropertyEnable: true,
+        tsParameterEnable: true,
+        tsReturnEnable: true,
+        etsVariablesEnable: true,
+        etsPropertyEnable: true,
+        etsParameterEnable: true,
+        etsReturnEnable: true,
+      },
+    },
     lspMaxOldSpaceSize: 8192,
   };
 }
