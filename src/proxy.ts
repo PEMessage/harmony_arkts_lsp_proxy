@@ -406,21 +406,105 @@ function offsetToPosition(text: string, offset: number): { line: number; charact
   return { line, character: clamped - lineStart };
 }
 
+/** Convert an LSP { line, character } into a UTF-16 code-unit offset in `text`. */
+function positionToOffset(text: string, position: unknown): number {
+  const pos = isPlainObject(position) ? position : {};
+  const targetLine = typeof pos.line === 'number' ? pos.line : 0;
+  const character = typeof pos.character === 'number' ? pos.character : 0;
+  let offset = 0;
+  let line = 0;
+  while (line < targetLine && offset < text.length) {
+    const nl = text.indexOf('\n', offset);
+    if (nl === -1) {
+      offset = text.length;
+      break;
+    }
+    offset = nl + 1;
+    line += 1;
+  }
+  return Math.min(offset + character, text.length);
+}
+
+/**
+ * Apply LSP content changes to a document. Clients with incremental sync send
+ * range-based changes; a change without a range replaces the whole document.
+ */
+function applyContentChanges(text: string, changes: readonly unknown[]): string {
+  let result = text;
+  for (const change of changes) {
+    if (!isPlainObject(change) || typeof change.text !== 'string') {
+      continue;
+    }
+    if (!isPlainObject(change.range)) {
+      result = change.text;
+      continue;
+    }
+    const start = positionToOffset(result, change.range.start);
+    const end = positionToOffset(result, change.range.end);
+    result = result.slice(0, start) + change.text + result.slice(Math.max(start, end));
+  }
+  return result;
+}
+
+/**
+ * ace-server sometimes pushes hints computed before the latest edit, which
+ * would place them at meaningless positions. Drop hints that clearly cannot
+ * belong at their offset (inside a string literal, or a type hint on a
+ * declaration that already has a type annotation).
+ */
+function hintOffsetLooksPlausible(text: string, offset: number, kind: string): boolean {
+  if (!Number.isFinite(offset) || offset < 0 || offset > text.length) {
+    return false;
+  }
+  const lineStart = text.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+  const prefix = text.slice(lineStart, offset);
+
+  // Not inside an unterminated string / template.
+  let quote: string | null = null;
+  for (let i = 0; i < prefix.length; i += 1) {
+    const ch = prefix[i];
+    if (quote) {
+      if (ch === quote && prefix[i - 1] !== '\\') {
+        quote = null;
+      }
+    } else if (ch === '"' || ch === "'" || ch === '`') {
+      quote = ch;
+    }
+  }
+  if (quote) {
+    return false;
+  }
+
+  // A Type hint annotates a not-yet-annotated declaration; if the same line
+  // already has a type annotation before this point, the hint is misplaced.
+  if (kind === 'Type' && prefix.includes(':')) {
+    return false;
+  }
+  return true;
+}
+
 /** Convert ace-server's pushed `inlayHints` into standard LSP InlayHint[] . */
 function convertAceInlayHints(text: string, inlayHints: unknown): unknown[] {
   if (!Array.isArray(inlayHints)) {
     return [];
   }
-  return inlayHints.filter(isPlainObject).map((hint) => ({
-    position: offsetToPosition(text, typeof hint.position === 'number' ? hint.position : 0),
-    label: typeof hint.text === 'string' ? hint.text : '',
-    kind: hint.kind === 'Type' ? 1 : 2,
-    paddingLeft: Boolean(hint.whitespaceBefore),
-    paddingRight: Boolean(hint.whitespaceAfter),
-  }));
+  return inlayHints
+    .filter(isPlainObject)
+    .filter((hint) => {
+      const offset = typeof hint.position === 'number' ? hint.position : 0;
+      return hintOffsetLooksPlausible(text, offset, typeof hint.kind === 'string' ? hint.kind : '');
+    })
+    .map((hint) => ({
+      position: offsetToPosition(text, typeof hint.position === 'number' ? hint.position : 0),
+      label: typeof hint.text === 'string' ? hint.text : '',
+      kind: hint.kind === 'Type' ? 1 : 2,
+      paddingLeft: Boolean(hint.whitespaceBefore),
+      paddingRight: Boolean(hint.whitespaceAfter),
+    }));
 }
 
-function createRequestPayload(params: RpcParams): RpcPayload {  return {
+function createRequestPayload(params: RpcParams): RpcPayload {
+  return {
     requestId: createQueueToken(),
     params: params || {},
     editorFiles: [],
@@ -461,7 +545,12 @@ function extractTextDocument(params: RpcParams): Record<string, unknown> | null 
   return isPlainObject(textDocument) ? (textDocument as Record<string, unknown>) : null;
 }
 
-function mapNotification(method: string, params: RpcParams, openFiles: Set<string>): { method: string; params: RpcPayload } | null {
+function mapNotification(
+  method: string,
+  params: RpcParams,
+  openFiles: Set<string>,
+  documentTexts?: Map<string, string>,
+): { method: string; params: RpcPayload } | null {
   if (!ACE_NOTIFICATION_METHODS[method]) {
     return null;
   }
@@ -524,6 +613,16 @@ function mapNotification(method: string, params: RpcParams, openFiles: Set<strin
     if (!uri) {
       return null;
     }
+    // Send the reconstructed full document as a single change. ace-server's
+    // incremental path does not re-validate the document in this setup (no
+    // diagnostics or hints update while typing); its full-change path does.
+    const fullText = documentTexts?.get(uri);
+    const contentChanges =
+      typeof fullText === 'string'
+        ? [{ text: fullText }]
+        : Array.isArray(params?.contentChanges)
+          ? params?.contentChanges
+          : [];
     return {
       method: ACE_NOTIFICATION_METHODS[method],
       params: {
@@ -533,9 +632,9 @@ function mapNotification(method: string, params: RpcParams, openFiles: Set<strin
             uri,
             languageId: detectLanguageId(uri),
             version: textDocument.version,
-            text: typeof textDocument.text === 'string' ? textDocument.text : '',
+            text: typeof fullText === 'string' ? fullText : typeof textDocument.text === 'string' ? textDocument.text : '',
           },
-          contentChanges: Array.isArray(params?.contentChanges) ? params.contentChanges : [],
+          contentChanges,
         },
         editorFiles: getEditorFiles(openFiles),
         traceId: createQueueToken(),
@@ -774,13 +873,16 @@ export function createProxy(
 
   const openFiles = new Set<string>();
   const openDocumentTexts = new Map<string, string>();
+  // Bumped whenever the open document text changes, so cached ace-server
+  // results (whose offsets refer to an older revision) are never served stale.
+  const documentRevisions = new Map<string, number>();
   const requestQueue: Array<QueuedRequest> = [];
   const notificationQueue: Array<QueuedNotification> = [];
   const pendingAceRequests = new Map<string, PendingAceRequest>();
   // ace-server answers `textDocument/inlayHint` by pushing
   // `aceProject/parameterNameInlayHints` (often proactively, before a request),
   // so cache the latest hints per document and serve requests from it.
-  const latestInlayHints = new Map<string, unknown>();
+  const latestInlayHints = new Map<string, { revision: number; hints: unknown }>();
   const pendingInlayHints = new Map<string, (hints: unknown) => void>();
   let isInitialized = false;
   let isServerReady = false;
@@ -902,7 +1004,12 @@ export function createProxy(
         const payload = isPlainObject(params) ? params : {};
         const uri = typeof payload.uri === 'string' ? payload.uri : null;
         if (uri) {
-          latestInlayHints.set(uri, payload.inlayHints);
+          // The offsets in this payload refer to the document as ace-server saw
+          // it, which is the current revision when the push arrives.
+          latestInlayHints.set(uri, {
+            revision: documentRevisions.get(uri) ?? 0,
+            hints: payload.inlayHints,
+          });
           const resolve = pendingInlayHints.get(uri);
           if (resolve) {
             pendingInlayHints.delete(uri);
@@ -949,28 +1056,36 @@ export function createProxy(
       return Promise.resolve([]);
     }
     const text = (): string => openDocumentTexts.get(uri) ?? readFileText(uri) ?? '';
+    const revision = documentRevisions.get(uri) ?? 0;
     const cached = latestInlayHints.get(uri);
 
-    // Ask for a refresh so the next request sees current hints.
-    try {
-      conn.sendRequest('textDocument/inlayHint', (params ?? {}) as RpcPayload).catch(() => undefined);
-    } catch {
-      /* ignore */
+    const finish = (hints: unknown): unknown => convertAceInlayHints(text(), hints);
+
+    // Serve the cache only when it was computed for the current revision;
+    // otherwise the offsets would point at the wrong place after an edit.
+    if (cached && cached.revision === revision) {
+      return Promise.resolve(finish(cached.hints));
     }
 
-    if (cached !== undefined) {
-      return Promise.resolve(convertAceInlayHints(text(), cached));
+    // ace-server only pushes hints once it has been asked; ask on the first
+    // request so hints start flowing, then rely on its validation pushes.
+    if (!cached) {
+      try {
+        conn.sendRequest('textDocument/inlayHint', (params ?? {}) as RpcPayload).catch(() => undefined);
+      } catch {
+        /* ignore */
+      }
     }
 
-    // No hints pushed yet: wait briefly for ace-server to push some.
     return new Promise<unknown>((resolve) => {
       const timer = setTimeout(() => {
         pendingInlayHints.delete(uri);
-        resolve(convertAceInlayHints(text(), latestInlayHints.get(uri) ?? []));
-      }, 2500);
+        const latest = latestInlayHints.get(uri);
+        resolve(latest && latest.revision === revision ? finish(latest.hints) : []);
+      }, 1500);
       pendingInlayHints.set(uri, (hints) => {
         clearTimeout(timer);
-        resolve(convertAceInlayHints(text(), hints));
+        resolve(finish(hints));
       });
     });
   }
@@ -1206,6 +1321,8 @@ export function createProxy(
         if (typeof textDocument?.text === 'string') {
           openDocumentTexts.set(uri, textDocument.text);
         }
+        documentRevisions.set(uri, (documentRevisions.get(uri) ?? 0) + 1);
+        latestInlayHints.delete(uri);
       }
     }
 
@@ -1213,9 +1330,21 @@ export function createProxy(
       const textDocument = isPlainObject(params) ? (params.textDocument as Record<string, unknown>) : undefined;
       const uri = isPlainObject(textDocument) ? (textDocument.uri as string | undefined) : undefined;
       const contentChanges = isPlainObject(params) && Array.isArray(params.contentChanges) ? params.contentChanges : [];
-      const lastChange = contentChanges[contentChanges.length - 1];
-      if (uri && isPlainObject(lastChange) && typeof lastChange.text === 'string') {
-        openDocumentTexts.set(uri, lastChange.text);
+      if (uri && typeof uri === 'string') {
+        const current = openDocumentTexts.get(uri);
+        if (typeof current === 'string') {
+          openDocumentTexts.set(uri, applyContentChanges(current, contentChanges));
+        } else {
+          // Not tracked locally (e.g. opened before the proxy attached): only a
+          // full-document change is safe to store.
+          const lastChange = contentChanges[contentChanges.length - 1];
+          if (isPlainObject(lastChange) && !lastChange.range && typeof lastChange.text === 'string') {
+            openDocumentTexts.set(uri, lastChange.text);
+          }
+        }
+        documentRevisions.set(uri, (documentRevisions.get(uri) ?? 0) + 1);
+        // Never serve hints computed before this change.
+        latestInlayHints.delete(uri);
       }
     }
 
@@ -1225,6 +1354,8 @@ export function createProxy(
       if (uri && typeof uri === 'string') {
         openFiles.delete(uri);
         openDocumentTexts.delete(uri);
+        documentRevisions.delete(uri);
+        latestInlayHints.delete(uri);
       }
     }
 
@@ -1242,7 +1373,7 @@ export function createProxy(
       return;
     }
 
-    const mapped = mapNotification(method, params, openFiles);
+    const mapped = mapNotification(method, params, openFiles, openDocumentTexts);
     const finalMethod = mapped ? mapped.method : method;
     const finalParams = mapped ? mapped.params : (createRequestPayload(params) as RpcPayload);
 

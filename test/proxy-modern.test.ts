@@ -426,6 +426,88 @@ describe('createProxy modern mode', () => {
     ]);
   });
 
+  it('converts inlay hints against the text after an incremental change', async () => {
+    const fakeAce = createFakeAceServer({
+      inlayHints: [{ text: ': void', position: 17, kind: 'Type', whitespaceBefore: true }],
+    });
+    aceConnection = fakeAce.connection;
+    mockedStartAceServer.mockReturnValue(fakeAce.handle);
+
+    const env = createEnv();
+    const client = createClient(env);
+    proxyHandle = client.handle;
+    clientConnection = client.connection;
+
+    const filePath = path.resolve('test/fixtures/sample-project/entry/src/main/ets/pages/Index.ets');
+    const uri = `file://${filePath}`;
+
+    await clientConnection.sendRequest('initialize', {
+      processId: process.pid,
+      rootUri: 'file:///tmp/not-the-arkts-project',
+      capabilities: {},
+    });
+    clientConnection.sendNotification('initialized', {});
+    clientConnection.sendNotification('textDocument/didOpen', {
+      textDocument: { uri, languageId: 'arkts', version: 1, text: 'void build() {\n}\n' },
+    });
+    // nvim sends an incremental change; the proxy must reconstruct the text so
+    // offset 17 maps to line 1, column 12 (not into the old document).
+    clientConnection.sendNotification('textDocument/didChange', {
+      textDocument: { uri, version: 2 },
+      contentChanges: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }, text: '// x\n' }],
+    });
+
+    const hints = await timeout(
+      clientConnection.sendRequest('textDocument/inlayHint', {
+        textDocument: { uri },
+        range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } },
+      }),
+      500,
+    );
+
+    expect(hints).toEqual([
+      { position: { line: 1, character: 12 }, label: ': void', kind: 1, paddingLeft: true, paddingRight: false },
+    ]);
+  });
+
+  it('drops inlay hints that land at an implausible offset', async () => {
+    const fakeAce = createFakeAceServer({
+      // A type hint placed after an existing annotation is meaningless; this is
+      // what stale ace-server pushes look like after an edit.
+      inlayHints: [{ text: ': void', position: 6, kind: 'Type', whitespaceBefore: true }],
+    });
+    aceConnection = fakeAce.connection;
+    mockedStartAceServer.mockReturnValue(fakeAce.handle);
+
+    const env = createEnv();
+    const client = createClient(env);
+    proxyHandle = client.handle;
+    clientConnection = client.connection;
+
+    const filePath = path.resolve('test/fixtures/sample-project/entry/src/main/ets/pages/Index.ets');
+    const uri = `file://${filePath}`;
+
+    await clientConnection.sendRequest('initialize', {
+      processId: process.pid,
+      rootUri: 'file:///tmp/not-the-arkts-project',
+      capabilities: {},
+    });
+    clientConnection.sendNotification('initialized', {});
+    clientConnection.sendNotification('textDocument/didOpen', {
+      textDocument: { uri, languageId: 'arkts', version: 1, text: 'let x: number = 1;\n' },
+    });
+
+    const hints = await timeout(
+      clientConnection.sendRequest('textDocument/inlayHint', {
+        textDocument: { uri },
+        range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } },
+      }),
+      500,
+    );
+
+    expect(hints).toEqual([]);
+  });
+
   it('does not block initialize while hvigor sync is running in background', async () => {
     const fakeAce = createFakeAceServer();
     aceConnection = fakeAce.connection;
